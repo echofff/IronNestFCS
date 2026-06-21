@@ -1,0 +1,129 @@
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Runtime.Loader;
+using IronNestFCS.Abstractions;
+using MelonLoader;
+
+namespace IronNestFCS;
+
+/// <summary>
+/// 负责把 Logic 程序集加载进一个可回收的 AssemblyLoadContext，
+/// 并在需要时卸载 + 重新加载，实现热重载。
+/// </summary>
+internal sealed class LogicReloader
+{
+    private readonly string logicDllPath;
+    private readonly string logicTypeName;
+
+    private AssemblyLoadContext? alc;
+    private IFcsModule? current;
+    private WeakReference? alcWeakRef;
+
+    public IFcsModule? Current => current;
+
+    public LogicReloader(string logicDllPath, string logicTypeName)
+    {
+        this.logicDllPath = logicDllPath;
+        this.logicTypeName = logicTypeName;
+    }
+
+    /// <summary>卸载当前 Logic（若有），从磁盘重新加载并初始化。</summary>
+    public bool Reload()
+    {
+        Unload();
+
+        if (!File.Exists(logicDllPath))
+        {
+            MelonLogger.Error($"[Reload] Logic dll 不存在: {logicDllPath}");
+            return false;
+        }
+
+        try
+        {
+            alc = new AssemblyLoadContext("IronNestFCS.Logic", isCollectible: true);
+            alcWeakRef = new WeakReference(alc, trackResurrection: true);
+
+            // 从内存字节加载，避免锁住磁盘上的 dll（Rider 重编译时需要能覆盖它）。
+            byte[] bytes = File.ReadAllBytes(logicDllPath);
+            string pdbPath = Path.ChangeExtension(logicDllPath, ".pdb");
+            Assembly asm;
+            using (var dllStream = new MemoryStream(bytes))
+            {
+                if (File.Exists(pdbPath))
+                {
+                    using var pdbStream = new MemoryStream(File.ReadAllBytes(pdbPath));
+                    asm = alc.LoadFromStream(dllStream, pdbStream);
+                }
+                else
+                {
+                    asm = alc.LoadFromStream(dllStream);
+                }
+            }
+
+            Type? type = asm.GetType(logicTypeName);
+            if (type == null)
+            {
+                MelonLogger.Error($"[Reload] 在 Logic 程序集中找不到类型: {logicTypeName}");
+                Unload();
+                return false;
+            }
+
+            if (Activator.CreateInstance(type) is not IFcsModule module)
+            {
+                MelonLogger.Error($"[Reload] {logicTypeName} 未实现 IFcsModule");
+                Unload();
+                return false;
+            }
+
+            current = module;
+            bool ok = current.Initialize();
+            if (!ok)
+            {
+                MelonLogger.Warning("[Reload] Logic.Initialize() 返回 false。");
+            }
+            else
+            {
+                MelonLogger.Msg("[Reload] Logic 加载并初始化成功。");
+            }
+            return ok;
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Error($"[Reload] 加载 Logic 失败: {ex}");
+            Unload();
+            return false;
+        }
+    }
+
+    /// <summary>关闭当前 Logic 并卸载其 AssemblyLoadContext。</summary>
+    public void Unload()
+    {
+        if (current != null)
+        {
+            try { current.Shutdown(); }
+            catch (Exception ex) { MelonLogger.Error($"[Reload] Logic.Shutdown() 抛异常: {ex}"); }
+            current = null;
+        }
+
+        if (alc != null)
+        {
+            try { alc.Unload(); }
+            catch (Exception ex) { MelonLogger.Error($"[Reload] ALC.Unload() 抛异常: {ex}"); }
+            alc = null;
+        }
+
+        // 提示 GC 回收旧上下文。卸载是异步的——不强求立即完成，
+        // 仅在诊断时观察 alcWeakRef.IsAlive。
+        CollectOldContext();
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void CollectOldContext()
+    {
+        for (int i = 0; i < 2 && alcWeakRef is { IsAlive: true }; i++)
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+        }
+    }
+}
