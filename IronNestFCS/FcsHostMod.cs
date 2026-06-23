@@ -51,7 +51,7 @@ public class FcsHostMod : MelonMod
         if (reloader == null)
             return;
 
-        if (ReloadKeyPressed())
+        if (ReloadKeyPressed() || reloader.CheckDllUpdated())
         {
             MelonLogger.Msg($"[{ReloadKeyName}] 触发热重载...");
             reloader.Reload();

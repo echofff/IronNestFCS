@@ -21,10 +21,19 @@ internal sealed class LogicReloader
 
     public IFcsModule? Current => current;
 
+    private DateTime lastWriteTime;
+
     public LogicReloader(string logicDllPath, string logicTypeName)
     {
         this.logicDllPath = logicDllPath;
         this.logicTypeName = logicTypeName;
+    }
+
+
+    /// <summary>检测Logic文件是否有更新</summary>
+    public bool CheckDllUpdated()
+    {
+        return current != null && lastWriteTime != File.GetLastWriteTime(logicDllPath);
     }
 
     /// <summary>卸载当前 Logic（若有），从磁盘重新加载并初始化。</summary>
@@ -83,6 +92,7 @@ internal sealed class LogicReloader
             }
             else
             {
+                lastWriteTime = File.GetLastWriteTime(logicDllPath);
                 MelonLogger.Msg("[Reload] Logic 加载并初始化成功。");
             }
             return ok;
